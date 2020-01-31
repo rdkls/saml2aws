@@ -267,6 +267,7 @@ type passwordLoginResponse struct {
 	Canary                                string `json:"canary"`
 	CorrelationID                         string `json:"correlationId"`
 	SessionID                             string `json:"sessionId"`
+	SErrorCode							  string `json:"sErrorCode"`
 	Locale                                struct {
 		Mkt  string `json:"mkt"`
 		Lcid int    `json:"lcid"`
@@ -624,11 +625,16 @@ func New(idpAccount *cfg.IDPAccount) (*Client, error) {
 	}, nil
 }
 
+
 // Authenticate to AzureAD and return the data from the body of the SAML assertion.
 func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error) {
 
 	var samlAssertion string
 	var res *http.Response
+
+	estsErrorMap := map[string]string {
+		"50126": "Invalid Username or Password",
+	}
 
 	// idpAccount.URL = https://account.activedirectory.windowsazure.com
 
@@ -642,7 +648,7 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 
 	// data is embeded javascript object
 	// <script><![CDATA[  $Config=......; ]]>
-	resBodyStr, err := ac.processAzureResponse(res)
+	resBodyStr, err := ac.processAzureResponse(res, 3)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error processing SAML response")
 	}
@@ -682,7 +688,7 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error retrieving login results")
 	}
-	resBodyStr, err = ac.processAzureResponse(res)
+	resBodyStr, err = ac.processAzureResponse(res, 3)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error processing login results")
 	}
@@ -836,7 +842,7 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		}
 		// data is embeded javascript object
 		// <script><![CDATA[  $Config=......; ]]>
-		resBodyStr, err := ac.processAzureResponse(res)
+		resBodyStr, err := ac.processAzureResponse(res, 0)
 		if err != nil {
 			return samlAssertion, errors.Wrap(err, "error processing auth response")
 		}
@@ -901,6 +907,11 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		ac.client.EnableFollowRedirect()
 	}
 
+	// At this point, we may receive "invalid username or password"
+	if loginPasswordResp.SErrorCode != "" {
+		return samlAssertion, errors.New(estsErrorMap[loginPasswordResp.SErrorCode])
+	}
+
 	//  oidc
 	doc, err := goquery.NewDocumentFromResponse(res)
 	if err != nil {
@@ -955,41 +966,32 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 
 	oidcResponseStr := string(oidcResponse)
 
-	// data is embeded javascript
-	// window.location = 'https:/..../?SAMLRequest=......'
-	oidcResponseList := strings.Split(oidcResponseStr, ";")
-	var SAMLRequestURL string
-	for _, v := range oidcResponseList {
-		if strings.Contains(v, "SAMLRequest") {
-			startURLPos := strings.Index(v, "https://")
-			endURLPos := strings.Index(v[startURLPos:], "'")
-			if endURLPos == -1 {
-				endURLPos = strings.Index(v[startURLPos:], "\"")
-			}
-			SAMLRequestURL = v[startURLPos : startURLPos+endURLPos]
-		}
+	// Find the javascript string containing "SAMLRequest", enclosed in single quotes
+	// This will be the the SAMLRequest URL
+	// e.g. https://login.microsoftonline.com/c2f52191-1cd3-40d7-a02c-b8a024896337/saml2?SAMLRequest=jZFRS8MwFIX%2FSsn72qSN2oW20K0bDCbIN...
+	// and GET it
+	re := regexp.MustCompile(`.*'([^']+SAMLRequest[^']+)'.*`)
+	SAMLRequestURL := re.FindStringSubmatch(oidcResponseStr)[1]
 
-	}
 	if SAMLRequestURL == "" {
 		return samlAssertion, fmt.Errorf("unable to locate SAMLRequest URL")
 	}
-
 	req, err = http.NewRequest("GET", SAMLRequestURL, nil)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error building get request")
 	}
-
 	res, err = ac.client.Do(req)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error retrieving oidc login form results")
 	}
-
-	// if mfa skipped then get $Config and urlSkipMfaRegistration
-	// get urlSkipMfaRegistraition to return saml assertion
-	resBodyStr, err = ac.processAzureResponse(res)
+	resBody, err := ioutil.ReadAll(res.Body)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error processing oidc login response")
 	}
+	resBodyStr = string(resBody)
+
+	// If MFA skipped then get $Config and urlSkipMfaRegistration
+	// Then GET urlSkipMfaRegistration, to return SAML assertion
 	if strings.Contains(resBodyStr, "urlSkipMfaRegistration") {
 		var samlAssertionSkipMfaResp SkipMfaResponse
 		var skipMfaJson string
@@ -1004,22 +1006,23 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		if err := json.Unmarshal([]byte(skipMfaJson), &samlAssertionSkipMfaResp); err != nil {
 			return samlAssertion, errors.Wrap(err, "SAMLAssertion skip mfa response unmarshal error")
 		}
+		// GET the URLSkipMfaRegistration
 		res, err = ac.client.Get(samlAssertionSkipMfaResp.URLSkipMfaRegistration)
 		if err != nil {
 			return samlAssertion, errors.Wrap(err, "SAMLAssertion skip mfa url get  error")
 		}
-		resBodyStr, err = ac.processAzureResponse(res)
+		resBody, err = ioutil.ReadAll(res.Body)
 		if err != nil {
 			return samlAssertion, errors.Wrap(err, "error processing SAMLAssertion skip mfa response")
 		}
+		resBodyStr = string(resBody)
 	}
 
-	// data in input tag
+	// Get the value of <input name="SAMLResponse">
 	doc, err = goquery.NewDocumentFromReader(strings.NewReader(resBodyStr))
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "failed to build document from response")
 	}
-
 	doc.Find("input").Each(func(i int, s *goquery.Selection) {
 		attrName, ok := s.Attr("name")
 		if !ok {
@@ -1036,7 +1039,7 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		return samlAssertion, nil
 	}
 	
-	resBodyStr, err = ac.processAzureResponse(res)
+	resBodyStr, err = ac.processAzureResponse(res, 1)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error processing saml response")
 	}
@@ -1082,7 +1085,7 @@ func (ac *Client) extractConfigJson(resBodyStr string) (string, error) {
 // In this case, submit the form (copy all the hidden inputs and make the POST to the form's action)
 // This may happen multiple times if e.g. Conditional Access Policies are enabled, for MFA or Terms of Use
 // Therefore - we keep doing so until the response is not a <form>
-func (ac *Client) processAzureResponse(res *http.Response) (string, error) {
+func (ac *Client) processAzureResponse(res *http.Response, num_possible_reprocesses int) (string, error) {
 	var resBodyStr string
 
 	resBody, _ := ioutil.ReadAll(res.Body)
@@ -1090,7 +1093,7 @@ func (ac *Client) processAzureResponse(res *http.Response) (string, error) {
 
 	// Form returned, requires reprocessing
 	// (and keep reprocessing until there is no form)
-	for strings.Contains(resBodyStr, "<form") {
+	for strings.Contains(resBodyStr, "<form") && (0 <= num_possible_reprocesses) {
 		// There's a Conditional Access Policy requiring acceptance of Terms of Use
 		if strings.Contains(resBodyStr, "action='https://account.activedirectory.windowsazure.com/TermsOfUse'") {
 			return "", errors.New("Organization Terms of Use need to be accepted before using saml2aws. Please visit https://login.microsoftonline.com in your browser to do so, and try again.")
@@ -1131,6 +1134,7 @@ func (ac *Client) processAzureResponse(res *http.Response) (string, error) {
 		}
 		resBody, _ := ioutil.ReadAll(res.Body)
 		resBodyStr = string(resBody)
+		num_possible_reprocesses--
 	}
 	return resBodyStr, nil
 }

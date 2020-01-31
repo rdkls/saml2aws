@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -641,13 +642,14 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 
 	// data is embeded javascript object
 	// <script><![CDATA[  $Config=......; ]]>
-	resBody, _ := ioutil.ReadAll(res.Body)
-	resBodyStr := string(resBody)
+	resBodyStr, err := ac.processAzureResponse(res)
+	if err != nil {
+		return samlAssertion, errors.Wrap(err, "error processing SAML response")
+	}
 	var startSAMLJson string
-	if strings.Contains(resBodyStr, "$Config") {
-		startIndex := strings.Index(resBodyStr, "$Config=") + 8
-		endIndex := startIndex + strings.Index(resBodyStr[startIndex:], ";")
-		startSAMLJson = resBodyStr[startIndex:endIndex]
+	startSAMLJson, err = ac.extractConfigJson(resBodyStr)
+	if err != nil {
+		return samlAssertion, errors.Wrap(err, "startSaml response - Couldn't find $Config JSON")
 	}
 	var startSAMLResp startSAMLResponse
 	if err := json.Unmarshal([]byte(startSAMLJson), &startSAMLResp); err != nil {
@@ -680,26 +682,17 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error retrieving login results")
 	}
-	resBody, _ = ioutil.ReadAll(res.Body)
-	resBodyStr = string(resBody)
-
-	// require reprocess
-	if strings.Contains(resBodyStr, "<form") {
-		res, err = ac.reProcess(resBodyStr)
-		if err != nil {
-			return samlAssertion, errors.Wrap(err, "error retrieving login reprocess results")
-		}
-		resBody, _ = ioutil.ReadAll(res.Body)
-		resBodyStr = string(resBody)
+	resBodyStr, err = ac.processAzureResponse(res)
+	if err != nil {
+		return samlAssertion, errors.Wrap(err, "error processing login results")
 	}
 
 	// data is embeded javascript object
 	// <script><![CDATA[  $Config=......; ]]>
 	var loginPasswordJson string
-	if strings.Contains(resBodyStr, "$Config") {
-		startIndex := strings.Index(resBodyStr, "$Config=") + 8
-		endIndex := startIndex + strings.Index(resBodyStr[startIndex:], ";")
-		loginPasswordJson = resBodyStr[startIndex:endIndex]
+	loginPasswordJson, err = ac.extractConfigJson(resBodyStr)
+	if err != nil {
+		return samlAssertion, errors.Wrap(err, "loginPassword response - Couldn't find $Config JSON")
 	}
 	var loginPasswordResp passwordLoginResponse
 	var loginPasswordSkipMfaResp SkipMfaResponse
@@ -843,15 +836,18 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		}
 		// data is embeded javascript object
 		// <script><![CDATA[  $Config=......; ]]>
-		resBody, _ = ioutil.ReadAll(res.Body)
-		resBodyStr = string(resBody)
+		resBodyStr, err := ac.processAzureResponse(res)
+		if err != nil {
+			return samlAssertion, errors.Wrap(err, "error processing auth response")
+		}
 
 		var ProcessAuthJson string
-		if strings.Contains(resBodyStr, "$Config") {
-			startIndex := strings.Index(resBodyStr, "$Config=") + 8
-			endIndex := startIndex + strings.Index(resBodyStr[startIndex:], ";")
-			ProcessAuthJson = resBodyStr[startIndex:endIndex]
+		// Extract the $Config = {...} JSON element
+		ProcessAuthJson, err = ac.extractConfigJson(resBodyStr)
+		if err != nil {
+			return samlAssertion, errors.Wrap(err, "ProcessAuth response - Couldn't find $Config JSON")
 		}
+
 		var processAuthResp processAuthResponse
 		if err := json.Unmarshal([]byte(ProcessAuthJson), &processAuthResp); err != nil {
 			return samlAssertion, errors.Wrap(err, "ProcessAuth response unmarshal error")
@@ -990,19 +986,18 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 
 	// if mfa skipped then get $Config and urlSkipMfaRegistration
 	// get urlSkipMfaRegistraition to return saml assertion
-	resBody, err = ioutil.ReadAll(res.Body)
+	resBodyStr, err = ac.processAzureResponse(res)
 	if err != nil {
-		return samlAssertion, errors.Wrap(err, "error oidc login response read")
+		return samlAssertion, errors.Wrap(err, "error processing oidc login response")
 	}
-	resBodyStr = string(resBody)
 	if strings.Contains(resBodyStr, "urlSkipMfaRegistration") {
 		var samlAssertionSkipMfaResp SkipMfaResponse
 		var skipMfaJson string
 		responseList := strings.Split(resBodyStr, "<")
 		for _, line := range responseList {
-
-			if strings.Contains(line, "$Config") {
-				skipMfaJson = line[strings.Index(line, "$Config=")+8 : strings.LastIndex(line, ";")]
+			// Extract the $Config = {...} JSON element
+			skipMfaJson, err = ac.extractConfigJson(line)
+			if err != nil {
 				break
 			}
 		}
@@ -1013,11 +1008,10 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		if err != nil {
 			return samlAssertion, errors.Wrap(err, "SAMLAssertion skip mfa url get  error")
 		}
-		resBody, err = ioutil.ReadAll(res.Body)
+		resBodyStr, err = ac.processAzureResponse(res)
 		if err != nil {
-			return samlAssertion, errors.Wrap(err, "SAMLAssertion skip mfa request error")
+			return samlAssertion, errors.Wrap(err, "error processing SAMLAssertion skip mfa response")
 		}
-		resBodyStr = string(resBody)
 	}
 
 	// data in input tag
@@ -1041,12 +1035,12 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	if samlAssertion != "" {
 		return samlAssertion, nil
 	}
-	res, err = ac.reProcess(resBodyStr)
+	
+	resBodyStr, err = ac.processAzureResponse(res)
 	if err != nil {
-		return samlAssertion, errors.Wrap(err, "failed to saml request reprocess")
+		return samlAssertion, errors.Wrap(err, "error processing saml response")
 	}
-	resBody, _ = ioutil.ReadAll(res.Body)
-	resBodyStr = string(resBody)
+	
 	doc, err = goquery.NewDocumentFromReader(strings.NewReader(resBodyStr))
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "failed to build document from result body")
@@ -1070,40 +1064,73 @@ func (ac *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	return samlAssertion, errors.New("failed get SAMLAssersion")
 }
 
-func (ac *Client) reProcess(resBodyStr string) (*http.Response, error) {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(resBodyStr))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to build document from response")
+// Extract the JSON from the "$Config={...}" lines in a response from Azure
+// Note the optional whitespace around the '='; this does vary from response to response
+// (notably - if Conditional Access Policy for Terms of Use enabled)
+func (ac *Client) extractConfigJson(resBodyStr string) (string, error) {
+	re := regexp.MustCompile(`(?s)\$Config\s*=\s*({.*?});`)
+	matches := re.FindStringSubmatch(resBodyStr)
+	if 2 == len(matches) {
+		return matches[1], nil
+	} else {
+		return "", errors.New("Couldn't find $Config JSON")
 	}
+}
 
-	var action, ctx, flowToken string
-	doc.Find("form").Each(func(i int, s *goquery.Selection) {
-		action, _ = s.Attr("action")
-	})
-	doc.Find("input").Each(func(i int, s *goquery.Selection) {
-		attrName, ok := s.Attr("name")
-		if !ok {
-			return
-		}
-		if attrName == "ctx" {
-			ctx, _ = s.Attr("value")
-		}
-		if attrName == "flowtoken" {
-			flowToken, _ = s.Attr("value")
-		}
-	})
+// Process a response from AzureAD
+// Often these will contain just a <form> with hidden elements, and script to form.submit()
+// In this case, submit the form (copy all the hidden inputs and make the POST to the form's action)
+// This may happen multiple times if e.g. Conditional Access Policies are enabled, for MFA or Terms of Use
+// Therefore - we keep doing so until the response is not a <form>
+func (ac *Client) processAzureResponse(res *http.Response) (string, error) {
+	var resBodyStr string
 
-	reprocessValues := url.Values{}
-	reprocessValues.Set("ctx", ctx)
-	reprocessValues.Set("flowtoken", flowToken)
-	reprocessRequest, err := http.NewRequest("post", action, strings.NewReader(reprocessValues.Encode()))
-	if err != nil {
-		return nil, errors.Wrap(err, "error reprocess create httpRequest")
+	resBody, _ := ioutil.ReadAll(res.Body)
+	resBodyStr = string(resBody)
+
+	// Form returned, requires reprocessing
+	// (and keep reprocessing until there is no form)
+	for strings.Contains(resBodyStr, "<form") {
+		// There's a Conditional Access Policy requiring acceptance of Terms of Use
+		if strings.Contains(resBodyStr, "action='https://account.activedirectory.windowsazure.com/TermsOfUse'") {
+			return "", errors.New("Organization Terms of Use need to be accepted before using saml2aws. Please visit https://login.microsoftonline.com in your browser to do so, and try again.")
+		}
+
+		// As far as we know, all forms auto-submit i.e. contain something like <script>document.form.submit();</script>
+		// Reprocess just takes all hidden inputs and submits to the specified form action (destination url)
+		doc, err := goquery.NewDocumentFromReader(strings.NewReader(resBodyStr))
+		if err != nil {
+			return "", errors.Wrap(err, "failed to build document from response")
+		}
+
+		var action string
+		doc.Find("form").Each(func(i int, s *goquery.Selection) {
+			action, _ = s.Attr("action")
+		})
+		reprocessValues := url.Values{}
+		doc.Find("input").Each(func(i int, s *goquery.Selection) {
+			attrType, _ := s.Attr("type")
+			if attrType != "hidden" {
+				return
+			}
+			attrName, ok := s.Attr("name")
+			if !ok {
+				return
+			}
+			attrValue, _ := s.Attr("value")
+			reprocessValues.Set(attrName, attrValue)
+		})
+		reprocessRequest, err := http.NewRequest("post", action, strings.NewReader(reprocessValues.Encode()))
+		if err != nil {
+			return "", errors.Wrap(err, "error reprocess create httpRequest")
+		}
+		reprocessRequest.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		res, err := ac.client.Do(reprocessRequest)
+		if err != nil {
+			return "", errors.Wrap(err, "error reprocess results")
+		}
+		resBody, _ := ioutil.ReadAll(res.Body)
+		resBodyStr = string(resBody)
 	}
-	reprocessRequest.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	res, err := ac.client.Do(reprocessRequest)
-	if err != nil {
-		return res, errors.Wrap(err, "error reprocess results")
-	}
-	return res, nil
+	return resBodyStr, nil
 }
